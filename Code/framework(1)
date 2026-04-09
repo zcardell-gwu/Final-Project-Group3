@@ -1,0 +1,224 @@
+import tensorflow as tf
+from tensorflow.keras import layers, models, callbacks
+from tensorflow.keras import optimizers
+import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.metrics import classification_report
+
+#-----------------------------------------------------------------------------------------------------------------------
+# Part a: Load CIFAR-10 dataset using built-in Keras function
+(x_train, y_train), (x_test, y_test) = tf.keras.datasets.cifar10.load_data()
+
+# Inspect raw data properties (Before normalization)
+print(f"Training images shape: {x_train.shape}")
+print(f"Training labels shape: {y_train.shape}")
+print(f"Test images shape: {x_test.shape}")
+print(f"Test labels shape: {y_test.shape}")
+
+print(f"Data type: {x_train.dtype}")
+print(f"Min pixel value: {x_train.min()}")
+print(f"Max pixel value: {x_train.max()}")
+
+#-----------------------------------------------------------------------------------------------------------------------
+# Part b: Normalize pixel values to be between 0 and 1
+x_train = x_train.astype('float32') / 255.0
+x_test = x_test.astype('float32') / 255.0
+
+num_classes = 10
+y_train_one_hot = tf.keras.utils.to_categorical(y_train, num_classes)
+y_test_one_hot = tf.keras.utils.to_categorical(y_test, num_classes)
+
+# Print the shape of the resulting one-hot training label array
+print(f"One-hot training labels shape: {y_train_one_hot.shape}")
+
+# Define class names for CIFAR-10
+class_names = ['airplane', 'automobile', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck']
+
+#-----------------------------------------------------------------------------------------------------------------------
+# Part c: Create the base datasets from the preprocessed arrays
+train_ds = tf.data.Dataset.from_tensor_slices((x_train, y_train_one_hot))
+test_ds = tf.data.Dataset.from_tensor_slices((x_test, y_test_one_hot))
+
+# Configure Training Pipeline: Shuffle (10k) -> Batch (64) -> Prefetch
+train_ds = train_ds.shuffle(10000).batch(64).prefetch(tf.data.AUTOTUNE)
+
+# Configure Test Pipeline: Batch (64) -> Prefetch (No Shuffle)
+test_ds = test_ds.batch(64).prefetch(tf.data.AUTOTUNE)
+
+print(f"Total Training Batches: {len(train_ds)}")
+print(f"Total Test Batches:     {len(test_ds)}\n")
+
+#-----------------------------------------------------------------------------------------------------------------------
+# Part d: Define class names strictly as requested
+class_names = ['airplane', 'automobile', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck']
+
+# Create a figure for the 3x4 grid
+plt.figure(figsize=(10, 8))
+
+for i in range(12):
+
+    plt.subplot(3, 4, i + 1)
+    plt.imshow(x_train[i])
+    label_index = int(y_train[i][0])
+    plt.title(class_names[label_index])
+    plt.axis('off')
+
+plt.savefig('sample_images.png')
+
+#-----------------------------------------------------------------------------------------------------------------------
+# Part e: use a Sequential model strictly for the augmentation layers requested.
+data_augmentation = models.Sequential([layers.RandomFlip("horizontal"), layers.RandomRotation(0.1), layers.RandomZoom(0.1),
+                                       layers.RandomContrast(0.1)])
+
+sample_image = x_train[0]
+plt.figure(figsize=(10, 10))
+plt.subplot(3, 3, 1)
+plt.imshow(sample_image)
+plt.title("Original")
+plt.axis('off')
+
+sample_batch = tf.expand_dims(sample_image, 0)
+
+for i in range(8):
+    augmented_image = data_augmentation(sample_batch, training=True)
+    plt.subplot(3, 3, i + 2)
+    plt.imshow(augmented_image[0])
+    plt.title(f"Augmented {i + 1}")
+    plt.axis('off')
+
+plt.savefig('augmented_samples.png')
+
+#-----------------------------------------------------------------------------------------------------------------------
+# Part f: Build and Train MLP & CNN
+input_shape = (32, 32, 3)
+num_classes = 10
+
+my_callbacks = [
+    callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
+    callbacks.ReduceLROnPlateau(monitor='val_loss', patience=3, factor=0.5)
+]
+
+inputs_mlp = layers.Input(shape=input_shape)
+x = layers.Flatten()(inputs_mlp)
+x = layers.Dense(512, activation='relu')(x)
+x = layers.Dropout(0.3)(x)
+x = layers.Dense(256, activation='relu')(x)
+x = layers.Dropout(0.3)(x)
+outputs_mlp = layers.Dense(num_classes, activation='softmax')(x)
+
+mlp_model = models.Model(inputs=inputs_mlp, outputs=outputs_mlp, name="MLP_Model")
+mlp_model.summary()
+
+# Compile MLP
+mlp_model.compile(optimizer=optimizers.Adam(learning_rate=0.001), loss='categorical_crossentropy', metrics=['accuracy'])
+history_mlp = mlp_model.fit(train_ds, epochs=20, validation_data=test_ds, callbacks=my_callbacks)
+inputs_cnn = layers.Input(shape=input_shape)
+
+
+x = data_augmentation(inputs_cnn)
+x = layers.Conv2D(32, (3, 3), padding='same', activation='relu')(x)
+x = layers.BatchNormalization()(x)
+x = layers.MaxPooling2D((2, 2))(x)
+
+x = layers.Conv2D(64, (3, 3), padding='same', activation='relu')(x)
+x = layers.BatchNormalization()(x)
+x = layers.MaxPooling2D((2, 2))(x)
+
+x = layers.Conv2D(128, (3, 3), padding='same', activation='relu')(x)
+x = layers.BatchNormalization()(x)
+x = layers.MaxPooling2D((2, 2))(x)
+
+x = layers.Flatten()(x)
+x = layers.Dense(256, activation='relu')(x)
+x = layers.Dropout(0.4)(x)
+
+outputs_cnn = layers.Dense(num_classes, activation='softmax')(x)
+cnn_model = models.Model(inputs=inputs_cnn, outputs=outputs_cnn, name="CNN_Model")
+cnn_model.summary()
+
+cnn_model.compile(optimizer=optimizers.Adam(learning_rate=0.001), loss='categorical_crossentropy', metrics=['accuracy'])
+
+history_cnn = cnn_model.fit(train_ds, epochs=20, validation_data=test_ds, callbacks=my_callbacks)
+
+
+#-----------------------------------------------------------------------------------------------------------------------
+# Part g: Plot Learning Curves
+def plot_learning_curves(history, model_name, filename):
+    """
+    Helper function to plot training/validation accuracy and loss.
+    """
+    # Extract data from the history object
+    acc = history.history['accuracy']
+    val_acc = history.history['val_accuracy']
+    loss = history.history['loss']
+    val_loss = history.history['val_loss']
+
+    # Create the figure with 2 subplots (side-by-side)
+    plt.figure(figsize=(14, 5))
+
+    # --- Left Subplot: Accuracy ---
+    plt.subplot(1, 2, 1)
+    plt.plot(acc, label='Training Accuracy')
+    plt.plot(val_acc, label='Validation Accuracy')
+    plt.title(f'{model_name}: Training vs Validation Accuracy')
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy')
+    plt.legend(loc='lower right')
+    plt.grid(True)
+
+    # --- Right Subplot: Loss ---
+    plt.subplot(1, 2, 2)
+    plt.plot(loss, label='Training Loss')
+    plt.plot(val_loss, label='Validation Loss')
+    plt.title(f'{model_name}: Training vs Validation Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend(loc='upper right')
+    plt.grid(True)
+
+    # Save the figure
+    plt.savefig(filename)
+    print(f"Saved plot for {model_name} as '{filename}'")
+
+
+# 1. Plot MLP History
+plot_learning_curves(history_mlp, "MLP Model", "mlp_history.png")
+
+# 2. Plot CNN History
+plot_learning_curves(history_cnn, "CNN Model", "cnn_history.png")
+
+print("\n--- Part (g): All Tasks Completed Successfully ---")
+
+#-----------------------------------------------------------------------------------------------------------------------
+# Part h: Evaluate, Compare, and Discuss
+
+# Evaluate MLP on Test Data
+print("\nEvaluating MLP Model...")
+mlp_loss, mlp_acc = mlp_model.evaluate(test_ds, verbose=0)
+print(f"MLP Test Accuracy: {mlp_acc:.4f}")
+
+# Evaluate CNN on Test Data
+print("Evaluating CNN Model...")
+cnn_loss, cnn_acc = cnn_model.evaluate(test_ds, verbose=0)
+print(f"CNN Test Accuracy: {cnn_acc:.4f}")
+
+# Generate Classification Reports and predictions from the test pipeline.
+print("\n--- MLP Classification Report ---")
+y_pred_mlp = mlp_model.predict(test_ds, verbose=0)
+y_pred_mlp_classes = np.argmax(y_pred_mlp, axis=1)
+print(classification_report(y_test.flatten(), y_pred_mlp_classes, target_names=class_names))
+
+print("\n--- CNN Classification Report ---")
+y_pred_cnn = cnn_model.predict(test_ds, verbose=0)
+y_pred_cnn_classes = np.argmax(y_pred_cnn, axis=1)
+print(classification_report(y_test.flatten(), y_pred_mlp_classes, target_names=class_names))
+
+# Discussion (Multi-line String)
+discussion = """
+DISCUSSION: WHY CNN OUTPERFORMS MLP
+The CNN works much better than the MLP because it treats images as pictures, not just a list of numbers. 
+While the MLP destroys the image structure by flattening it into a long line, the CNN uses filters to scan the image, preserving spatial locality so it knows which pixels belong together to form shapes. 
+Also, thanks to parameter sharing, once the CNN learns to recognize a feature (like an edge or a curve), it can find that feature anywhere in the image using the same filter. 
+This makes the CNN much more efficient about visual patterns compared to the brute-force approach of an MLP.
+"""
+print(discussion)
