@@ -1,0 +1,44 @@
+import os
+import pandas as pd
+from PIL import Image
+import tensorflow as tf
+from tensorflow.keras import layers, models, callbacks
+from tensorflow.keras import optimizers
+import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.metrics import classification_report
+from config import IMG_DIR, ATTR_CSV, PARTITION_CSV, IMG_SIZE, BATCH_SIZE, NUM_ATTRS, OUTPUT_DIR
+
+#-----------------------------------------------------------------------------------------------------------------------
+# Part a: Load CelebA dataset
+attr_df = pd.read_csv(ATTR_CSV)
+attr_df = attr_df.replace(-1, 0)
+
+print(f"Total images: {len(attr_df)}")
+print(f"Number of attributes: {len(attr_df.columns) - 1}")
+print(f"Attribute names: {list(attr_df.columns[1:])}")
+print(f"Sample data:\n{attr_df.head()}")
+
+#-----------------------------------------------------------------------------------------------------------------------
+# Part b: Normalize pixel values and prepare labels
+attribute_names = list(attr_df.columns[1:])
+all_labels = attr_df[attribute_names].values.astype('float32')
+
+partition_df = pd.read_csv(PARTITION_CSV)  # ← 不再寫死路徑
+train_idx = partition_df[partition_df['partition'] == 0].index
+val_idx   = partition_df[partition_df['partition'] == 1].index
+test_idx  = partition_df[partition_df['partition'] == 2].index
+
+train_files  = attr_df['image_id'].values[train_idx]
+val_files    = attr_df['image_id'].values[val_idx]
+test_files   = attr_df['image_id'].values[test_idx]
+
+train_labels = all_labels[train_idx]
+val_labels   = all_labels[val_idx]
+test_labels  = all_labels[test_idx]
+
+print(f"Train size: {len(train_files)}")
+print(f"Val size:   {len(val_files)}")
+print(f"Test size:  {len(test_files)}")
+print(f"Label shape (train): {train_labels.shape}")
+print(f"Attribute names: {attribute_names}")
