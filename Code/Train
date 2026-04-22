@@ -1,0 +1,488 @@
+import random
+import cv2
+import pandas as pd
+from sklearn.metrics import f1_score, hamming_loss
+import torch
+import torch.nn as nn
+import numpy as np
+from torch.utils import data
+from torch.amp import autocast, GradScaler
+from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torchvision import transforms, models
+from tqdm import tqdm
+import os
+
+# ── Reproducibility ────────────────────────────────────────────────────────────
+torch.manual_seed(16)
+np.random.seed(16)
+random.seed(16)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(16)
+    torch.backends.cudnn.deterministic = True
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+# celeba/
+# ├── code/
+# │   └── framework.py          ← this file
+# ├── data/
+# │   └── img_align_celeba/     ← 202,599 jpg
+# ├── list_attr_celeba.csv
+# └── list_eval_partition.csv
+BASE_DIR       = os.path.dirname(os.path.abspath(__file__))      # celeba/code/
+CELEBA_DIR     = os.path.dirname(BASE_DIR)                       # celeba/
+DATA_DIR       = os.path.join(CELEBA_DIR, "data", "img_align_celeba") + os.path.sep
+ATTR_FILE      = os.path.join(CELEBA_DIR, "list_attr_celeba.csv")
+PARTITION_FILE = os.path.join(CELEBA_DIR, "list_eval_partition.csv")
+CACHE_DIR      = os.path.join(CELEBA_DIR, "tensor_cache")   # preprocessed tensors saved here
+
+# ── Hyperparameters ────────────────────────────────────────────────────────────
+n_epoch    = 20
+BATCH_SIZE = 32
+LR         = 0.0001
+IMAGE_SIZE = 224
+OUTPUTS_a  = 40          # CelebA has exactly 40 binary attributes
+NICKNAME   = "Group3"
+SAVE_MODEL = True
+device     = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+CLASS_NAMES = [
+    "5_o_Clock_Shadow","Arched_Eyebrows","Attractive","Bags_Under_Eyes","Bald",
+    "Bangs","Big_Lips","Big_Nose","Black_Hair","Blond_Hair","Blurry","Brown_Hair",
+    "Bushy_Eyebrows","Chubby","Double_Chin","Eyeglasses","Goatee","Gray_Hair",
+    "Heavy_Makeup","High_Cheekbones","Male","Mouth_Slightly_Open","Mustache",
+    "Narrow_Eyes","No_Beard","Oval_Face","Pale_Skin","Pointy_Nose",
+    "Receding_Hairline","Rosy_Cheeks","Sideburns","Smiling","Straight_Hair",
+    "Wavy_Hair","Wearing_Earrings","Wearing_Hat","Wearing_Lipstick",
+    "Wearing_Necklace","Wearing_Necktie","Young",
+]
+
+# ── Dataset ────────────────────────────────────────────────────────────────────
+class CelebADataset(data.Dataset):
+    def __init__(self, df: pd.DataFrame, split: str):
+        self.df    = df.reset_index(drop=True)
+        self.split = split
+        self.aug   = transforms.Compose([
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(10),
+            transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+        ])
+        self.norm  = transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row    = self.df.iloc[idx]
+        y      = torch.FloatTensor([int(e) for e in row["target_class"].split(",")])
+        img_id = row["image_id"]
+
+        # ── Disk cache: load preprocessed tensor if available ──────────────────
+        cache_key  = img_id.replace(".jpg", f"_{IMAGE_SIZE}.pt")
+        cache_path = os.path.join(CACHE_DIR, cache_key)
+
+        if os.path.exists(cache_path):
+            X = torch.load(cache_path, weights_only=True)   # (3, H, W) float32
+        else:
+            img = cv2.imread(DATA_DIR + img_id)
+            if img is None:
+                img = np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+            # CLAHE – improves local contrast on face images
+            lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+            lab[:,:,0] = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8)).apply(lab[:,:,0])
+            img = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+
+            img = cv2.GaussianBlur(img, (3,3), 0)
+            img = cv2.resize(img, (IMAGE_SIZE, IMAGE_SIZE))
+            X   = torch.FloatTensor(img / 255.0).permute(2,0,1)   # (3,H,W)
+
+            # Save to cache (normalize is NOT cached so aug+norm stay flexible)
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            torch.save(X, cache_path)
+
+        if self.split == "train":
+            X = self.aug(X)
+        return self.norm(X), y
+
+
+# ── Data loading ───────────────────────────────────────────────────────────────
+def load_celeba():
+    df_attr = pd.read_csv(ATTR_FILE)
+    if "image_id" not in df_attr.columns:
+        df_attr = df_attr.reset_index().rename(columns={"index": "image_id"})
+    df_attr[CLASS_NAMES] = ((df_attr[CLASS_NAMES] + 1) // 2).astype(int)  # {-1,1}→{0,1}
+
+    df_part = pd.read_csv(PARTITION_FILE)
+    if "image_id" not in df_part.columns:
+        df_part = df_part.reset_index().rename(columns={"index": "image_id"})
+    part_col = [c for c in df_part.columns if c != "image_id"][0]
+    df_part  = df_part.rename(columns={part_col: "partition"})
+
+    df = df_attr.merge(df_part, on="image_id")
+    df["target_class"] = df[CLASS_NAMES].apply(lambda r: ",".join(str(v) for v in r), axis=1)
+
+    # Drop rows whose image file does not exist on disk (corrupted / incomplete unzip)
+    exists = df["image_id"].apply(lambda f: os.path.isfile(DATA_DIR + f))
+    n_missing = (~exists).sum()
+    if n_missing > 0:
+        print(f"  ⚠ Skipping {n_missing} missing images (check your unzip).")
+        df = df[exists].reset_index(drop=True)
+
+    print(f"CelebA loaded: {len(df):,} images | "
+          f"train={(df.partition==0).sum():,}  "
+          f"val={(df.partition==1).sum():,}  "
+          f"test={(df.partition==2).sum():,}")
+    return df
+
+
+def make_loaders(df_train, df_val, df_test):
+    kw_train = dict(batch_size=BATCH_SIZE, shuffle=True,  num_workers=4, pin_memory=True)
+    kw_eval  = dict(batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+    return (
+        data.DataLoader(CelebADataset(df_train, "train"), **kw_train),
+        data.DataLoader(CelebADataset(df_val,   "val"),   **kw_eval),
+        data.DataLoader(CelebADataset(df_test,  "test"),  **kw_eval),
+    )
+
+
+# ── Model ──────────────────────────────────────────────────────────────────────
+def save_model(model):
+    """Save model architecture + class names to summary_{NICKNAME}.txt for sharing."""
+    with open(f"summary_{NICKNAME}.txt", "w") as f:
+        print(f"NICKNAME   : {NICKNAME}",           file=f)
+        print(f"OUTPUTS_a  : {OUTPUTS_a}",          file=f)
+        print(f"IMAGE_SIZE : {IMAGE_SIZE}",          file=f)
+        print(f"BATCH_SIZE : {BATCH_SIZE}",          file=f)
+        print(f"LR         : {LR}",                  file=f)
+        print(f"n_epoch    : {n_epoch}",             file=f)
+        print(f"\nCLASS_NAMES:\n{CLASS_NAMES}\n",   file=f)
+        print(model,                                  file=f)
+    print(f"  → summary saved to summary_{NICKNAME}.txt")
+
+
+class CNN_BiLSTM(nn.Module):
+    """
+    DenseNet169 backbone → BiLSTM over spatial rows → multi-label classifier
+
+    Flow:
+      Image (B,3,H,W)
+        → DenseNet169 feature map  (B, 1664, h, w)   h=w=7 for 224px input
+        → treat h rows as timesteps, each row = w*1664 features
+        → BiLSTM(hidden=512, layers=2)
+        → take last hidden state from both directions → (B, 1024)
+        → Linear → (B, 40)
+
+    Rationale for CelebA:
+      Face images have a natural top-to-bottom spatial order
+      (hair → forehead → eyes → nose → mouth → chin).
+      BiLSTM can model both top-down and bottom-up dependencies
+      across these spatial rows, which plain global-pooling discards.
+    """
+    def __init__(self, lstm_hidden=512, lstm_layers=2, dropout=0.3):
+        super().__init__()
+
+        # ── CNN backbone (remove original classifier) ──────────────────────────
+        backbone = models.densenet169(weights="DenseNet169_Weights.DEFAULT")
+        # DenseNet features output shape: (B, 1664, 7, 7) for 224×224 input
+        self.cnn_features = backbone.features   # keep all conv blocks
+        self.cnn_norm     = nn.BatchNorm2d(1664)
+        self.cnn_act      = nn.ReLU(inplace=True)
+        cnn_out_ch        = 1664                # DenseNet169 final channels
+
+        # ── BiLSTM ─────────────────────────────────────────────────────────────
+        # input_size = width(7) × channels(1664) = 11648  (one row of feature map)
+        self.lstm_input_size = 7 * cnn_out_ch   # updated dynamically in forward if needed
+        self.lstm = nn.LSTM(
+            input_size  = self.lstm_input_size,
+            hidden_size = lstm_hidden,
+            num_layers  = lstm_layers,
+            batch_first = True,
+            bidirectional = True,
+            dropout = dropout if lstm_layers > 1 else 0.0,
+        )
+
+        # ── Classifier head ────────────────────────────────────────────────────
+        self.head = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(lstm_hidden * 2, 256),    # *2 because bidirectional
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, OUTPUTS_a),
+        )
+
+    def forward(self, x):
+        # x: (B, 3, H, W)
+        feat = self.cnn_act(self.cnn_norm(self.cnn_features(x)))
+        # feat: (B, C, h, w)  e.g. (B, 1664, 7, 7)
+
+        B, C, h, w = feat.shape
+        # Reshape → sequence of h rows, each row = w*C features
+        seq = feat.permute(0, 2, 1, 3)         # (B, h, C, w)
+        seq = seq.reshape(B, h, C * w)          # (B, h, C*w)  = (B, 7, 11648)
+
+        # Update LSTM input size dynamically (handles different image sizes)
+        if seq.size(2) != self.lstm_input_size:
+            self.lstm_input_size = seq.size(2)
+
+        out, (hn, _) = self.lstm(seq)
+        # hn: (num_layers*2, B, hidden) — take last layer, both directions
+        fwd = hn[-2]   # forward  last layer
+        bwd = hn[-1]   # backward last layer
+        combined = torch.cat([fwd, bwd], dim=1)  # (B, hidden*2)
+
+        return self.head(combined)               # (B, OUTPUTS_a)
+
+
+def build_model():
+    model     = CNN_BiLSTM(lstm_hidden=512, lstm_layers=2, dropout=0.3).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-2)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2)
+    scaler    = GradScaler()
+    save_model(model)
+    return model, optimizer, criterion, scheduler, scaler
+
+
+# ── Per-class threshold tuning ─────────────────────────────────────────────────
+def tune_thresholds(probs, labels):
+    """Find the per-class decision threshold that maximises F1."""
+    thresholds = []
+    for c in range(OUTPUTS_a):
+        best_t, best_f1 = 0.5, 0.0
+        for t in np.arange(0.1, 0.9, 0.05):
+            f1 = f1_score(labels[:, c], (probs[:, c] >= t).astype(int), zero_division=0)
+            if f1 > best_f1:
+                best_f1, best_t = f1, t
+        thresholds.append(best_t)
+    return thresholds
+
+
+def apply_thresholds(probs, thresholds):
+    preds = np.zeros_like(probs)
+    for c in range(OUTPUTS_a):
+        preds[:, c] = (probs[:, c] >= thresholds[c]).astype(int)
+    return preds
+
+
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
+
+
+# ── Inference helper ───────────────────────────────────────────────────────────
+def run_inference(model, loader):
+    logits = []
+    with torch.no_grad():
+        for X, _ in loader:
+            logits.append(model(X.to(device)).cpu().numpy())
+    return sigmoid(np.vstack(logits))
+
+
+# ── Save test results ──────────────────────────────────────────────────────────
+def save_results(df_test, preds):
+    """
+    Writes results_{NICKNAME}.xlsx  – shareable with anyone who has the images.
+    Columns:
+      image_id | ground-truth attrs | pred_ohe | pred_attributes
+    """
+    out = df_test.copy().reset_index(drop=True)
+    out["pred_ohe"]        = [",".join(str(int(e)) for e in preds[i]) for i in range(len(preds))]
+    out["pred_attributes"] = ["|".join(CLASS_NAMES[c] for c in range(OUTPUTS_a) if preds[i,c]) for i in range(len(preds))]
+    out.to_excel(f"results_{NICKNAME}.xlsx", index=False)
+    print(f"  → results saved to results_{NICKNAME}.xlsx")
+
+
+def write_log(log_rows):
+    """
+    Writes training_log_{NICKNAME}.csv  – one row per epoch, easy to plot/share.
+    Columns: epoch | train_loss | train_f1 | val_loss | val_f1 | val_hlm
+    """
+    pd.DataFrame(log_rows).to_csv(f"training_log_{NICKNAME}.csv", index=False)
+
+
+# ── Per-attribute F1 analysis ─────────────────────────────────────────────────
+def analyse_per_attribute(model, val_ds, thresholds, tag="val"):
+    """
+    Compute per-class F1 on val set and save two files:
+      • per_attr_f1_{NICKNAME}.csv  – full table sorted by F1 ascending
+      • per_attr_f1_{NICKNAME}.txt  – human-readable ranked report
+    """
+    model.eval()
+    probs  = run_inference(model, val_ds)
+    labels = np.vstack([y.numpy() for _, y in val_ds])
+    preds  = apply_thresholds(probs, thresholds)
+
+    rows = []
+    for c, name in enumerate(CLASS_NAMES):
+        f1  = f1_score(labels[:, c], preds[:, c], zero_division=0)
+        pos = int(labels[:, c].sum())
+        rows.append({"attribute": name, "f1": round(f1, 4),
+                     "n_positive": pos, "threshold": round(thresholds[c], 2)})
+
+    df_attr = pd.DataFrame(rows).sort_values("f1", ascending=False).reset_index(drop=True)
+    df_attr.to_csv(f"per_attr_f1_{NICKNAME}.csv", index=False)
+
+    # Human-readable report
+    with open(f"per_attr_f1_{NICKNAME}.txt", "w") as f:
+        f.write(f"Per-attribute F1 Report  [{tag}]  —  {NICKNAME}\n")
+        f.write("=" * 55 + "\n")
+        f.write(f"{'Rank':<5} {'Attribute':<25} {'F1':>6}  {'N_pos':>7}  {'Thr':>5}\n")
+        f.write("-" * 55 + "\n")
+        for i, r in df_attr.iterrows():
+            f.write(f"{i+1:<5} {r.attribute:<25} {r.f1:>6.4f}  {r.n_positive:>7,}  {r.threshold:>5.2f}\n")
+        f.write("\n")
+        macro_f1 = df_attr["f1"].mean()
+        f.write(f"Macro F1 (avg of 40): {macro_f1:.4f}\n")
+        f.write(f"\nBottom 5 (hardest attributes):\n")
+        for _, r in df_attr.tail(5).iterrows():
+            f.write(f"  {r.attribute:<25} F1={r.f1:.4f}  N_pos={r.n_positive:,}\n")
+
+    print(f"  → per-attribute F1 saved to per_attr_f1_{NICKNAME}.csv / .txt")
+    return df_attr
+
+
+# ── Training loop ──────────────────────────────────────────────────────────────
+def train_and_test(train_ds, val_ds, test_ds):
+    model, optimizer, criterion, scheduler, scaler = build_model()
+    swa_model     = AveragedModel(model)
+    swa_scheduler = SWALR(optimizer, swa_lr=0.00005)
+    swa_start     = 8
+
+    best_f1         = 0.0
+    no_improve      = 0
+    patience        = 8
+    ckpt_path       = f"checkpoint_{NICKNAME}.pt"
+    best_thresholds = [0.5] * OUTPUTS_a
+    log_rows        = []          # accumulates one dict per epoch → training_log CSV
+
+    # Resume
+    if os.path.exists(ckpt_path):
+        ckpt = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        best_f1 = ckpt["best_f1"]
+        start   = ckpt["epoch"] + 1
+        print(f"Resumed from epoch {start}, best f1={best_f1:.5f}")
+    else:
+        start = 0
+
+    for epoch in range(start, n_epoch):
+
+        # ── Train ──────────────────────────────────────────────────────────────
+        model.train()
+        train_loss, steps = 0.0, 0
+        all_logits, all_labels = [], []
+
+        with tqdm(train_ds, desc=f"Ep{epoch} train") as pbar:
+            for X, y in pbar:
+                X, y = X.to(device), y.to(device)
+                optimizer.zero_grad()
+                with autocast(device_type="cuda"):
+                    out  = model(X)
+                    loss = criterion(out, y)
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+
+                train_loss += loss.item(); steps += 1
+                all_logits.append(out.detach().cpu().numpy())
+                all_labels.append(y.cpu().numpy())
+                pbar.set_postfix(loss=f"{train_loss/steps:.4f}")
+
+        train_f1 = f1_score(np.vstack(all_labels),
+                            (sigmoid(np.vstack(all_logits)) >= 0.5).astype(int),
+                            average="macro", zero_division=0)
+
+        # ── Validate ───────────────────────────────────────────────────────────
+        model.eval()
+        val_loss, steps = 0.0, 0
+        all_logits, all_labels = [], []
+
+        with torch.no_grad():
+            with tqdm(val_ds, desc=f"Ep{epoch}  val") as pbar:
+                for X, y in pbar:
+                    X, y = X.to(device), y.to(device)
+                    out  = model(X)
+                    val_loss += criterion(out, y).item(); steps += 1
+                    all_logits.append(out.cpu().numpy())
+                    all_labels.append(y.cpu().numpy())
+                    pbar.set_postfix(loss=f"{val_loss/steps:.4f}")
+
+        val_probs       = sigmoid(np.vstack(all_logits))
+        val_labels      = np.vstack(all_labels)
+        best_thresholds = tune_thresholds(val_probs, val_labels)
+        val_preds       = apply_thresholds(val_probs, best_thresholds)
+        val_f1          = f1_score(val_labels, val_preds, average="macro", zero_division=0)
+        val_hlm         = hamming_loss(val_labels, val_preds)
+
+        log_rows.append({"epoch": epoch, "train_loss": round(train_loss/steps, 5),
+                          "train_f1": round(train_f1, 5), "val_loss": round(val_loss/steps, 5),
+                          "val_f1": round(val_f1, 5), "val_hlm": round(val_hlm, 5)})
+        write_log(log_rows)
+        print(f"Ep{epoch} | train_f1={train_f1:.4f} "
+              f"| val_f1={val_f1:.4f}  hlm={val_hlm:.4f}")
+
+        # ── LR schedule ────────────────────────────────────────────────────────
+        if epoch > swa_start:
+            swa_model.update_parameters(model)
+            swa_scheduler.step()
+        else:
+            scheduler.step()
+
+        # ── Checkpoint ─────────────────────────────────────────────────────────
+        if val_f1 > best_f1 and SAVE_MODEL:
+            best_f1 = val_f1
+            no_improve = 0
+            torch.save(model.state_dict(), f"model_{NICKNAME}.pt")
+            torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict(), "epoch": epoch, "best_f1": best_f1},
+                       ckpt_path)
+            save_results(df_test, apply_thresholds(run_inference(model, test_ds), best_thresholds))
+            analyse_per_attribute(model, val_ds, best_thresholds, tag=f"ep{epoch}")
+            print(f"  ✔ saved  val_f1={best_f1:.5f}")
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                print(f"Early stop at epoch {epoch}")
+                break
+
+    # ── SWA finalisation ───────────────────────────────────────────────────────
+    print("Updating BN for SWA …")
+    update_bn(train_ds, swa_model, device=device)
+    swa_model.eval()
+
+    val_probs  = run_inference(swa_model, val_ds)
+    val_labels = np.vstack([y.numpy() for _, y in val_ds])
+    swa_thr    = tune_thresholds(val_probs, val_labels)
+    swa_preds  = apply_thresholds(val_probs, swa_thr)
+    swa_f1     = f1_score(val_labels, swa_preds, average="macro", zero_division=0)
+    print(f"SWA val_f1={swa_f1:.5f}  (best={best_f1:.5f})")
+
+    if swa_f1 > best_f1:
+        torch.save(swa_model.module.state_dict(), f"model_{NICKNAME}.pt")
+        save_results(df_test, apply_thresholds(run_inference(swa_model, test_ds), swa_thr))
+        analyse_per_attribute(swa_model, val_ds, swa_thr, tag="swa")
+        print("  ✔ SWA model saved!")
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    df_all   = load_celeba()
+    df_train = df_all[df_all["partition"] == 0].copy()
+    df_val   = df_all[df_all["partition"] == 1].copy()
+    df_test  = df_all[df_all["partition"] == 2].copy()
+
+    # pos_weight: compensate class imbalance across 40 attributes
+    targets    = np.array(df_train["target_class"]
+                          .apply(lambda s: [int(e) for e in s.split(",")]).tolist())
+    pos_weight = torch.tensor(
+        (targets.shape[0] - targets.sum(0)) / (targets.sum(0) + 1e-6),
+        dtype=torch.float32).to(device)
+
+    train_ds, val_ds, test_ds = make_loaders(df_train, df_val, df_test)
+    train_and_test(train_ds, val_ds, test_ds)
