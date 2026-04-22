@@ -42,7 +42,7 @@ BATCH_SIZE = 32
 LR         = 0.0001
 IMAGE_SIZE = 224
 OUTPUTS_a  = 40          # CelebA has exactly 40 binary attributes
-NICKNAME   = "Group3"
+NICKNAME   = "CelebA"
 SAVE_MODEL = True
 device     = "cuda:0" if torch.cuda.is_available() else "cpu"
 
@@ -77,30 +77,10 @@ class CelebADataset(data.Dataset):
         y      = torch.FloatTensor([int(e) for e in row["target_class"].split(",")])
         img_id = row["image_id"]
 
-        # ── Disk cache: load preprocessed tensor if available ──────────────────
-        cache_key  = img_id.replace(".jpg", f"_{IMAGE_SIZE}.pt")
-        cache_path = os.path.join(CACHE_DIR, cache_key)
-
-        if os.path.exists(cache_path):
-            X = torch.load(cache_path, weights_only=True)   # (3, H, W) float32
-        else:
-            img = cv2.imread(DATA_DIR + img_id)
-            if img is None:
-                img = np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8)
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-            # CLAHE – improves local contrast on face images
-            lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
-            lab[:,:,0] = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8)).apply(lab[:,:,0])
-            img = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-
-            img = cv2.GaussianBlur(img, (3,3), 0)
-            img = cv2.resize(img, (IMAGE_SIZE, IMAGE_SIZE))
-            X   = torch.FloatTensor(img / 255.0).permute(2,0,1)   # (3,H,W)
-
-            # Save to cache (normalize is NOT cached so aug+norm stay flexible)
-            os.makedirs(CACHE_DIR, exist_ok=True)
-            torch.save(X, cache_path)
+        # ── Disk cache: read-only (pre_cache() writes before training) ──────────
+        cache_path = os.path.join(CACHE_DIR,
+                                  img_id.replace(".jpg", f"_{IMAGE_SIZE}.pt"))
+        X = torch.load(cache_path, weights_only=True)   # (3, H, W) float32
 
         if self.split == "train":
             X = self.aug(X)
@@ -124,6 +104,77 @@ def load_celeba():
     df["target_class"] = df[CLASS_NAMES].apply(lambda r: ",".join(str(v) for v in r), axis=1)
 
     # Drop rows whose image file does not exist on disk (corrupted / incomplete unzip)
+    exists = d# ── Pre-cache: run once before training ───────────────────────────────────────
+def _cache_one(img_id):
+    """Module-level so multiprocessing spawn can pickle it (GPU-safe)."""
+    cache_path = os.path.join(CACHE_DIR,
+                              img_id.replace(".jpg", f"_{IMAGE_SIZE}.pt"))
+    if os.path.exists(cache_path):
+        return
+    img = cv2.imread(DATA_DIR + img_id)
+    if img is None:
+        img = np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+    lab[:, :, 0] = cv2.createCLAHE(
+        clipLimit=2.0, tileGridSize=(8, 8)).apply(lab[:, :, 0])
+    img = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+    img = cv2.GaussianBlur(img, (3, 3), 0)
+    img = cv2.resize(img, (IMAGE_SIZE, IMAGE_SIZE))
+    torch.save(torch.FloatTensor(img / 255.0).permute(2, 0, 1), cache_path)
+
+
+def pre_cache(df_all):
+    """
+    Process every image (CLAHE + GaussianBlur + resize) and save as .pt tensor.
+    Only processes images not yet cached — safe to interrupt and resume.
+    Uses spawn context so it is safe after CUDA has been initialised (GPU env).
+    """
+    import multiprocessing as mp
+
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    all_ids    = df_all["image_id"].tolist()
+    to_process = [
+        img_id for img_id in all_ids
+        if not os.path.exists(
+            os.path.join(CACHE_DIR, img_id.replace(".jpg", f"_{IMAGE_SIZE}.pt"))
+        )
+    ]
+
+    if not to_process:
+        print(f"  ✔ All {len(all_ids):,} images already cached in {CACHE_DIR}")
+        return
+
+    print(f"  Pre-caching {len(to_process):,} / {len(all_ids):,} images -> {CACHE_DIR}")
+    print(f"  (This runs once; all subsequent epochs load directly from cache.)")
+
+    # Use 'spawn' context — required when CUDA is available to avoid
+    # 'Cannot re-initialize CUDA in forked subprocess' errors
+    ctx = mp.get_context("spawn")
+    n_workers = min(8, mp.cpu_count())
+    with ctx.Pool(n_workers) as pool:
+        list(tqdm(pool.imap(_cache_one, to_process, chunksize=64),
+                  total=len(to_process), desc="Pre-caching"))
+
+    print("  ✔ Pre-cache complete.")
+
+
+def load_celeba():
+    df_attr = pd.read_csv(ATTR_FILE)
+    if "image_id" not in df_attr.columns:
+        df_attr = df_attr.reset_index().rename(columns={"index": "image_id"})
+    df_attr[CLASS_NAMES] = ((df_attr[CLASS_NAMES] + 1) // 2).astype(int)  # {-1,1}→{0,1}
+
+    df_part = pd.read_csv(PARTITION_FILE)
+    if "image_id" not in df_part.columns:
+        df_part = df_part.reset_index().rename(columns={"index": "image_id"})
+    part_col = [c for c in df_part.columns if c != "image_id"][0]
+    df_part  = df_part.rename(columns={part_col: "partition"})
+
+    df = df_attr.merge(df_part, on="image_id")
+    df["target_class"] = df[CLASS_NAMES].apply(lambda r: ",".join(str(v) for v in r), axis=1)
+
+    # Drop rows whose image file does not exist on disk
     exists = df["image_id"].apply(lambda f: os.path.isfile(DATA_DIR + f))
     n_missing = (~exists).sum()
     if n_missing > 0:
@@ -380,7 +431,7 @@ def train_and_test(train_ds, val_ds, test_ds):
             for X, y in pbar:
                 X, y = X.to(device), y.to(device)
                 optimizer.zero_grad()
-                with autocast(device_type="cuda"):
+                with autocast(device_type=device.split(":")[0]):
                     out  = model(X)
                     loss = criterion(out, y)
                 scaler.scale(loss).backward()
@@ -484,5 +535,6 @@ if __name__ == "__main__":
         (targets.shape[0] - targets.sum(0)) / (targets.sum(0) + 1e-6),
         dtype=torch.float32).to(device)
 
+    pre_cache(df_all)   # no-op if already cached
     train_ds, val_ds, test_ds = make_loaders(df_train, df_val, df_test)
     train_and_test(train_ds, val_ds, test_ds)
