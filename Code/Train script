@@ -29,22 +29,29 @@ if torch.cuda.is_available():
 # │   └── img_align_celeba/     ← 202,599 jpg
 # ├── list_attr_celeba.csv
 # └── list_eval_partition.csv
-BASE_DIR       = os.path.dirname(os.path.abspath(__file__))      # celeba/code/
-CELEBA_DIR     = os.path.dirname(BASE_DIR)                       # celeba/
+BASE_DIR       = os.path.dirname(os.path.abspath(__file__))   # celeba/code/
+CELEBA_DIR     = os.path.dirname(BASE_DIR)                    # celeba/
 DATA_DIR       = os.path.join(CELEBA_DIR, "data", "img_align_celeba") + os.path.sep
 ATTR_FILE      = os.path.join(CELEBA_DIR, "list_attr_celeba.csv")
 PARTITION_FILE = os.path.join(CELEBA_DIR, "list_eval_partition.csv")
-CACHE_DIR      = os.path.join(CELEBA_DIR, "tensor_cache")   # preprocessed tensors saved here
+CACHE_DIR      = os.path.join(CELEBA_DIR, "tensor_cache")    # preprocessed tensors
 
 # ── Hyperparameters ────────────────────────────────────────────────────────────
 n_epoch    = 20
 BATCH_SIZE = 32
 LR         = 0.0001
 IMAGE_SIZE = 224
-OUTPUTS_a  = 40          # CelebA has exactly 40 binary attributes
-NICKNAME   = "CelebA"
+OUTPUTS_a  = 40
+NICKNAME   = "Group3"
 SAVE_MODEL = True
 device     = "cuda:0" if torch.cuda.is_available() else "cpu"
+AMP_DEVICE = device.split(":")[0]   # "cuda" or "cpu"
+
+# DataLoader: persistent_workers keeps workers alive between epochs (no respawn)
+# prefetch_factor queues batches ahead so GPU never waits for data
+NUM_WORKERS     = min(8, os.cpu_count())
+PREFETCH_FACTOR = 4
+PERSISTENT      = True
 
 CLASS_NAMES = [
     "5_o_Clock_Shadow","Arched_Eyebrows","Attractive","Bags_Under_Eyes","Bald",
@@ -67,7 +74,8 @@ class CelebADataset(data.Dataset):
             transforms.RandomRotation(10),
             transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),
         ])
-        self.norm  = transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+        self.norm = transforms.Normalize([0.485, 0.456, 0.406],
+                                         [0.229, 0.224, 0.225])
 
     def __len__(self):
         return len(self.df)
@@ -77,7 +85,7 @@ class CelebADataset(data.Dataset):
         y      = torch.FloatTensor([int(e) for e in row["target_class"].split(",")])
         img_id = row["image_id"]
 
-        # ── Disk cache: read-only (pre_cache() writes before training) ──────────
+        # Load from disk cache (pre_cache must run before training)
         cache_path = os.path.join(CACHE_DIR,
                                   img_id.replace(".jpg", f"_{IMAGE_SIZE}.pt"))
         X = torch.load(cache_path, weights_only=True)   # (3, H, W) float32
@@ -87,26 +95,9 @@ class CelebADataset(data.Dataset):
         return self.norm(X), y
 
 
-# ── Data loading ───────────────────────────────────────────────────────────────
-def load_celeba():
-    df_attr = pd.read_csv(ATTR_FILE)
-    if "image_id" not in df_attr.columns:
-        df_attr = df_attr.reset_index().rename(columns={"index": "image_id"})
-    df_attr[CLASS_NAMES] = ((df_attr[CLASS_NAMES] + 1) // 2).astype(int)  # {-1,1}→{0,1}
-
-    df_part = pd.read_csv(PARTITION_FILE)
-    if "image_id" not in df_part.columns:
-        df_part = df_part.reset_index().rename(columns={"index": "image_id"})
-    part_col = [c for c in df_part.columns if c != "image_id"][0]
-    df_part  = df_part.rename(columns={part_col: "partition"})
-
-    df = df_attr.merge(df_part, on="image_id")
-    df["target_class"] = df[CLASS_NAMES].apply(lambda r: ",".join(str(v) for v in r), axis=1)
-
-    # Drop rows whose image file does not exist on disk (corrupted / incomplete unzip)
-    exists = d# ── Pre-cache: run once before training ───────────────────────────────────────
+# ── Pre-cache (module-level for GPU-safe spawn pickling) ──────────────────────
 def _cache_one(img_id):
-    """Module-level so multiprocessing spawn can pickle it (GPU-safe)."""
+    """Process one image and save as .pt tensor. Must be module-level for spawn."""
     cache_path = os.path.join(CACHE_DIR,
                               img_id.replace(".jpg", f"_{IMAGE_SIZE}.pt"))
     if os.path.exists(cache_path):
@@ -116,8 +107,8 @@ def _cache_one(img_id):
         img = np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8)
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
-    lab[:, :, 0] = cv2.createCLAHE(
-        clipLimit=2.0, tileGridSize=(8, 8)).apply(lab[:, :, 0])
+    lab[:, :, 0] = cv2.createCLAHE(clipLimit=2.0,
+                                    tileGridSize=(8, 8)).apply(lab[:, :, 0])
     img = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
     img = cv2.GaussianBlur(img, (3, 3), 0)
     img = cv2.resize(img, (IMAGE_SIZE, IMAGE_SIZE))
@@ -126,9 +117,9 @@ def _cache_one(img_id):
 
 def pre_cache(df_all):
     """
-    Process every image (CLAHE + GaussianBlur + resize) and save as .pt tensor.
-    Only processes images not yet cached — safe to interrupt and resume.
-    Uses spawn context so it is safe after CUDA has been initialised (GPU env).
+    Run once before training. Saves CLAHE+resize tensors to CACHE_DIR.
+    Safe to interrupt — already-cached files are skipped.
+    Uses spawn context (GPU-safe; fork crashes after CUDA is initialised).
     """
     import multiprocessing as mp
 
@@ -142,28 +133,24 @@ def pre_cache(df_all):
     ]
 
     if not to_process:
-        print(f"  ✔ All {len(all_ids):,} images already cached in {CACHE_DIR}")
+        print(f"  ✔ All {len(all_ids):,} images already cached → {CACHE_DIR}")
         return
 
-    print(f"  Pre-caching {len(to_process):,} / {len(all_ids):,} images -> {CACHE_DIR}")
-    print(f"  (This runs once; all subsequent epochs load directly from cache.)")
-
-    # Use 'spawn' context — required when CUDA is available to avoid
-    # 'Cannot re-initialize CUDA in forked subprocess' errors
+    print(f"  Pre-caching {len(to_process):,} / {len(all_ids):,} images …")
+    print(f"  (Runs once. Subsequent epochs read directly from cache.)")
     ctx = mp.get_context("spawn")
-    n_workers = min(8, mp.cpu_count())
-    with ctx.Pool(n_workers) as pool:
+    with ctx.Pool(min(8, mp.cpu_count())) as pool:
         list(tqdm(pool.imap(_cache_one, to_process, chunksize=64),
                   total=len(to_process), desc="Pre-caching"))
-
     print("  ✔ Pre-cache complete.")
 
 
+# ── Data loading ───────────────────────────────────────────────────────────────
 def load_celeba():
     df_attr = pd.read_csv(ATTR_FILE)
     if "image_id" not in df_attr.columns:
         df_attr = df_attr.reset_index().rename(columns={"index": "image_id"})
-    df_attr[CLASS_NAMES] = ((df_attr[CLASS_NAMES] + 1) // 2).astype(int)  # {-1,1}→{0,1}
+    df_attr[CLASS_NAMES] = ((df_attr[CLASS_NAMES] + 1) // 2).astype(int)
 
     df_part = pd.read_csv(PARTITION_FILE)
     if "image_id" not in df_part.columns:
@@ -172,13 +159,13 @@ def load_celeba():
     df_part  = df_part.rename(columns={part_col: "partition"})
 
     df = df_attr.merge(df_part, on="image_id")
-    df["target_class"] = df[CLASS_NAMES].apply(lambda r: ",".join(str(v) for v in r), axis=1)
+    df["target_class"] = df[CLASS_NAMES].apply(
+        lambda r: ",".join(str(v) for v in r), axis=1)
 
-    # Drop rows whose image file does not exist on disk
-    exists = df["image_id"].apply(lambda f: os.path.isfile(DATA_DIR + f))
+    exists    = df["image_id"].apply(lambda f: os.path.isfile(DATA_DIR + f))
     n_missing = (~exists).sum()
     if n_missing > 0:
-        print(f"  ⚠ Skipping {n_missing} missing images (check your unzip).")
+        print(f"  ⚠ Skipping {n_missing} missing images.")
         df = df[exists].reset_index(drop=True)
 
     print(f"CelebA loaded: {len(df):,} images | "
@@ -189,8 +176,12 @@ def load_celeba():
 
 
 def make_loaders(df_train, df_val, df_test):
-    kw_train = dict(batch_size=BATCH_SIZE, shuffle=True,  num_workers=4, pin_memory=True)
-    kw_eval  = dict(batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+    kw_train = dict(batch_size=BATCH_SIZE, shuffle=True,
+                    num_workers=NUM_WORKERS, pin_memory=True,
+                    persistent_workers=PERSISTENT, prefetch_factor=PREFETCH_FACTOR)
+    kw_eval  = dict(batch_size=BATCH_SIZE, shuffle=False,
+                    num_workers=NUM_WORKERS, pin_memory=True,
+                    persistent_workers=PERSISTENT, prefetch_factor=PREFETCH_FACTOR)
     return (
         data.DataLoader(CelebADataset(df_train, "train"), **kw_train),
         data.DataLoader(CelebADataset(df_val,   "val"),   **kw_eval),
@@ -200,16 +191,15 @@ def make_loaders(df_train, df_val, df_test):
 
 # ── Model ──────────────────────────────────────────────────────────────────────
 def save_model(model):
-    """Save model architecture + class names to summary_{NICKNAME}.txt for sharing."""
     with open(f"summary_{NICKNAME}.txt", "w") as f:
-        print(f"NICKNAME   : {NICKNAME}",           file=f)
-        print(f"OUTPUTS_a  : {OUTPUTS_a}",          file=f)
-        print(f"IMAGE_SIZE : {IMAGE_SIZE}",          file=f)
-        print(f"BATCH_SIZE : {BATCH_SIZE}",          file=f)
-        print(f"LR         : {LR}",                  file=f)
-        print(f"n_epoch    : {n_epoch}",             file=f)
-        print(f"\nCLASS_NAMES:\n{CLASS_NAMES}\n",   file=f)
-        print(model,                                  file=f)
+        print(f"NICKNAME   : {NICKNAME}",         file=f)
+        print(f"OUTPUTS_a  : {OUTPUTS_a}",        file=f)
+        print(f"IMAGE_SIZE : {IMAGE_SIZE}",        file=f)
+        print(f"BATCH_SIZE : {BATCH_SIZE}",        file=f)
+        print(f"LR         : {LR}",                file=f)
+        print(f"n_epoch    : {n_epoch}",           file=f)
+        print(f"\nCLASS_NAMES:\n{CLASS_NAMES}\n", file=f)
+        print(model,                               file=f)
     print(f"  → summary saved to summary_{NICKNAME}.txt")
 
 
@@ -219,45 +209,33 @@ class CNN_BiLSTM(nn.Module):
 
     Flow:
       Image (B,3,H,W)
-        → DenseNet169 feature map  (B, 1664, h, w)   h=w=7 for 224px input
-        → treat h rows as timesteps, each row = w*1664 features
+        → DenseNet169 feature map  (B, 1664, 7, 7)  for 224px input
+        → treat h=7 rows as timesteps, each = w*C features
         → BiLSTM(hidden=512, layers=2)
-        → take last hidden state from both directions → (B, 1024)
-        → Linear → (B, 40)
+        → concat last fwd+bwd hidden → (B, 1024)
+        → Linear head → (B, 40)
 
-    Rationale for CelebA:
-      Face images have a natural top-to-bottom spatial order
-      (hair → forehead → eyes → nose → mouth → chin).
-      BiLSTM can model both top-down and bottom-up dependencies
-      across these spatial rows, which plain global-pooling discards.
+    Rationale: face images have natural top-to-bottom spatial order
+    (hair → eyes → nose → mouth → chin). BiLSTM captures cross-row
+    dependencies that global average pooling discards.
     """
     def __init__(self, lstm_hidden=512, lstm_layers=2, dropout=0.3):
         super().__init__()
-
-        # ── CNN backbone (remove original classifier) ──────────────────────────
-        backbone = models.densenet169(weights="DenseNet169_Weights.DEFAULT")
-        # DenseNet features output shape: (B, 1664, 7, 7) for 224×224 input
-        self.cnn_features = backbone.features   # keep all conv blocks
+        backbone          = models.densenet169(weights="DenseNet169_Weights.DEFAULT")
+        self.cnn_features = backbone.features
         self.cnn_norm     = nn.BatchNorm2d(1664)
         self.cnn_act      = nn.ReLU(inplace=True)
-        cnn_out_ch        = 1664                # DenseNet169 final channels
-
-        # ── BiLSTM ─────────────────────────────────────────────────────────────
-        # input_size = width(7) × channels(1664) = 11648  (one row of feature map)
-        self.lstm_input_size = 7 * cnn_out_ch   # updated dynamically in forward if needed
         self.lstm = nn.LSTM(
-            input_size  = self.lstm_input_size,
-            hidden_size = lstm_hidden,
-            num_layers  = lstm_layers,
-            batch_first = True,
+            input_size    = 7 * 1664,
+            hidden_size   = lstm_hidden,
+            num_layers    = lstm_layers,
+            batch_first   = True,
             bidirectional = True,
-            dropout = dropout if lstm_layers > 1 else 0.0,
+            dropout       = dropout if lstm_layers > 1 else 0.0,
         )
-
-        # ── Classifier head ────────────────────────────────────────────────────
         self.head = nn.Sequential(
             nn.Dropout(dropout),
-            nn.Linear(lstm_hidden * 2, 256),    # *2 because bidirectional
+            nn.Linear(lstm_hidden * 2, 256),
             nn.BatchNorm1d(256),
             nn.ReLU(),
             nn.Dropout(dropout),
@@ -265,26 +243,12 @@ class CNN_BiLSTM(nn.Module):
         )
 
     def forward(self, x):
-        # x: (B, 3, H, W)
-        feat = self.cnn_act(self.cnn_norm(self.cnn_features(x)))
-        # feat: (B, C, h, w)  e.g. (B, 1664, 7, 7)
-
+        feat = self.cnn_act(self.cnn_norm(self.cnn_features(x)))  # (B,1664,7,7)
         B, C, h, w = feat.shape
-        # Reshape → sequence of h rows, each row = w*C features
-        seq = feat.permute(0, 2, 1, 3)         # (B, h, C, w)
-        seq = seq.reshape(B, h, C * w)          # (B, h, C*w)  = (B, 7, 11648)
-
-        # Update LSTM input size dynamically (handles different image sizes)
-        if seq.size(2) != self.lstm_input_size:
-            self.lstm_input_size = seq.size(2)
-
-        out, (hn, _) = self.lstm(seq)
-        # hn: (num_layers*2, B, hidden) — take last layer, both directions
-        fwd = hn[-2]   # forward  last layer
-        bwd = hn[-1]   # backward last layer
-        combined = torch.cat([fwd, bwd], dim=1)  # (B, hidden*2)
-
-        return self.head(combined)               # (B, OUTPUTS_a)
+        seq = feat.permute(0, 2, 1, 3).reshape(B, h, C * w)       # (B,7,11648)
+        _, (hn, _) = self.lstm(seq)
+        combined = torch.cat([hn[-2], hn[-1]], dim=1)              # (B,1024)
+        return self.head(combined)                                  # (B,40)
 
 
 def build_model():
@@ -297,14 +261,14 @@ def build_model():
     return model, optimizer, criterion, scheduler, scaler
 
 
-# ── Per-class threshold tuning ─────────────────────────────────────────────────
+# ── Threshold tuning ───────────────────────────────────────────────────────────
 def tune_thresholds(probs, labels):
-    """Find the per-class decision threshold that maximises F1."""
     thresholds = []
     for c in range(OUTPUTS_a):
         best_t, best_f1 = 0.5, 0.0
         for t in np.arange(0.1, 0.9, 0.05):
-            f1 = f1_score(labels[:, c], (probs[:, c] >= t).astype(int), zero_division=0)
+            f1 = f1_score(labels[:, c], (probs[:, c] >= t).astype(int),
+                          zero_division=0)
             if f1 > best_f1:
                 best_f1, best_t = f1, t
         thresholds.append(best_t)
@@ -322,7 +286,7 @@ def sigmoid(x):
     return 1 / (1 + np.exp(-x))
 
 
-# ── Inference helper ───────────────────────────────────────────────────────────
+# ── Inference ──────────────────────────────────────────────────────────────────
 def run_inference(model, loader):
     logits = []
     with torch.no_grad():
@@ -331,35 +295,23 @@ def run_inference(model, loader):
     return sigmoid(np.vstack(logits))
 
 
-# ── Save test results ──────────────────────────────────────────────────────────
+# ── Output helpers ─────────────────────────────────────────────────────────────
 def save_results(df_test, preds):
-    """
-    Writes results_{NICKNAME}.xlsx  – shareable with anyone who has the images.
-    Columns:
-      image_id | ground-truth attrs | pred_ohe | pred_attributes
-    """
     out = df_test.copy().reset_index(drop=True)
-    out["pred_ohe"]        = [",".join(str(int(e)) for e in preds[i]) for i in range(len(preds))]
-    out["pred_attributes"] = ["|".join(CLASS_NAMES[c] for c in range(OUTPUTS_a) if preds[i,c]) for i in range(len(preds))]
+    out["pred_ohe"] = [
+        ",".join(str(int(e)) for e in preds[i]) for i in range(len(preds))]
+    out["pred_attributes"] = [
+        "|".join(CLASS_NAMES[c] for c in range(OUTPUTS_a) if preds[i, c])
+        for i in range(len(preds))]
     out.to_excel(f"results_{NICKNAME}.xlsx", index=False)
     print(f"  → results saved to results_{NICKNAME}.xlsx")
 
 
 def write_log(log_rows):
-    """
-    Writes training_log_{NICKNAME}.csv  – one row per epoch, easy to plot/share.
-    Columns: epoch | train_loss | train_f1 | val_loss | val_f1 | val_hlm
-    """
     pd.DataFrame(log_rows).to_csv(f"training_log_{NICKNAME}.csv", index=False)
 
 
-# ── Per-attribute F1 analysis ─────────────────────────────────────────────────
 def analyse_per_attribute(model, val_ds, thresholds, tag="val"):
-    """
-    Compute per-class F1 on val set and save two files:
-      • per_attr_f1_{NICKNAME}.csv  – full table sorted by F1 ascending
-      • per_attr_f1_{NICKNAME}.txt  – human-readable ranked report
-    """
     model.eval()
     probs  = run_inference(model, val_ds)
     labels = np.vstack([y.numpy() for _, y in val_ds])
@@ -367,31 +319,34 @@ def analyse_per_attribute(model, val_ds, thresholds, tag="val"):
 
     rows = []
     for c, name in enumerate(CLASS_NAMES):
-        f1  = f1_score(labels[:, c], preds[:, c], zero_division=0)
-        pos = int(labels[:, c].sum())
-        rows.append({"attribute": name, "f1": round(f1, 4),
-                     "n_positive": pos, "threshold": round(thresholds[c], 2)})
+        rows.append({
+            "attribute":  name,
+            "f1":         round(f1_score(labels[:, c], preds[:, c],
+                                         zero_division=0), 4),
+            "n_positive": int(labels[:, c].sum()),
+            "threshold":  round(thresholds[c], 2),
+        })
+    df_a = (pd.DataFrame(rows)
+            .sort_values("f1", ascending=False)
+            .reset_index(drop=True))
+    df_a.to_csv(f"per_attr_f1_{NICKNAME}.csv", index=False)
 
-    df_attr = pd.DataFrame(rows).sort_values("f1", ascending=False).reset_index(drop=True)
-    df_attr.to_csv(f"per_attr_f1_{NICKNAME}.csv", index=False)
-
-    # Human-readable report
     with open(f"per_attr_f1_{NICKNAME}.txt", "w") as f:
-        f.write(f"Per-attribute F1 Report  [{tag}]  —  {NICKNAME}\n")
+        f.write(f"Per-attribute F1  [{tag}]  — {NICKNAME}\n")
         f.write("=" * 55 + "\n")
         f.write(f"{'Rank':<5} {'Attribute':<25} {'F1':>6}  {'N_pos':>7}  {'Thr':>5}\n")
         f.write("-" * 55 + "\n")
-        for i, r in df_attr.iterrows():
-            f.write(f"{i+1:<5} {r.attribute:<25} {r.f1:>6.4f}  {r.n_positive:>7,}  {r.threshold:>5.2f}\n")
-        f.write("\n")
-        macro_f1 = df_attr["f1"].mean()
-        f.write(f"Macro F1 (avg of 40): {macro_f1:.4f}\n")
-        f.write(f"\nBottom 5 (hardest attributes):\n")
-        for _, r in df_attr.tail(5).iterrows():
-            f.write(f"  {r.attribute:<25} F1={r.f1:.4f}  N_pos={r.n_positive:,}\n")
+        for i, r in df_a.iterrows():
+            f.write(f"{i+1:<5} {r.attribute:<25} {r.f1:>6.4f}"
+                    f"  {r.n_positive:>7,}  {r.threshold:>5.2f}\n")
+        f.write(f"\nMacro F1: {df_a['f1'].mean():.4f}\n")
+        f.write("\nBottom 5 (hardest):\n")
+        for _, r in df_a.tail(5).iterrows():
+            f.write(f"  {r.attribute:<25} F1={r.f1:.4f}"
+                    f"  N_pos={r.n_positive:,}\n")
 
-    print(f"  → per-attribute F1 saved to per_attr_f1_{NICKNAME}.csv / .txt")
-    return df_attr
+    print(f"  → per-attr F1 → per_attr_f1_{NICKNAME}.csv / .txt")
+    return df_a
 
 
 # ── Training loop ──────────────────────────────────────────────────────────────
@@ -406,9 +361,8 @@ def train_and_test(train_ds, val_ds, test_ds):
     patience        = 8
     ckpt_path       = f"checkpoint_{NICKNAME}.pt"
     best_thresholds = [0.5] * OUTPUTS_a
-    log_rows        = []          # accumulates one dict per epoch → training_log CSV
+    log_rows        = []
 
-    # Resume
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(ckpt["model"])
@@ -431,7 +385,7 @@ def train_and_test(train_ds, val_ds, test_ds):
             for X, y in pbar:
                 X, y = X.to(device), y.to(device)
                 optimizer.zero_grad()
-                with autocast(device_type=device.split(":")[0]):
+                with autocast(device_type=AMP_DEVICE):
                     out  = model(X)
                     loss = criterion(out, y)
                 scaler.scale(loss).backward()
@@ -440,7 +394,8 @@ def train_and_test(train_ds, val_ds, test_ds):
                 scaler.step(optimizer)
                 scaler.update()
 
-                train_loss += loss.item(); steps += 1
+                train_loss += loss.item()
+                steps      += 1
                 all_logits.append(out.detach().cpu().numpy())
                 all_labels.append(y.cpu().numpy())
                 pbar.set_postfix(loss=f"{train_loss/steps:.4f}")
@@ -459,7 +414,8 @@ def train_and_test(train_ds, val_ds, test_ds):
                 for X, y in pbar:
                     X, y = X.to(device), y.to(device)
                     out  = model(X)
-                    val_loss += criterion(out, y).item(); steps += 1
+                    val_loss += criterion(out, y).item()
+                    steps    += 1
                     all_logits.append(out.cpu().numpy())
                     all_labels.append(y.cpu().numpy())
                     pbar.set_postfix(loss=f"{val_loss/steps:.4f}")
@@ -468,32 +424,42 @@ def train_and_test(train_ds, val_ds, test_ds):
         val_labels      = np.vstack(all_labels)
         best_thresholds = tune_thresholds(val_probs, val_labels)
         val_preds       = apply_thresholds(val_probs, best_thresholds)
-        val_f1          = f1_score(val_labels, val_preds, average="macro", zero_division=0)
+        val_f1          = f1_score(val_labels, val_preds,
+                                   average="macro", zero_division=0)
         val_hlm         = hamming_loss(val_labels, val_preds)
 
-        log_rows.append({"epoch": epoch, "train_loss": round(train_loss/steps, 5),
-                          "train_f1": round(train_f1, 5), "val_loss": round(val_loss/steps, 5),
-                          "val_f1": round(val_f1, 5), "val_hlm": round(val_hlm, 5)})
+        log_rows.append({
+            "epoch":      epoch,
+            "train_loss": round(train_loss / steps, 5),
+            "train_f1":   round(train_f1, 5),
+            "val_loss":   round(val_loss / steps, 5),
+            "val_f1":     round(val_f1, 5),
+            "val_hlm":    round(val_hlm, 5),
+        })
         write_log(log_rows)
         print(f"Ep{epoch} | train_f1={train_f1:.4f} "
               f"| val_f1={val_f1:.4f}  hlm={val_hlm:.4f}")
 
-        # ── LR schedule ────────────────────────────────────────────────────────
         if epoch > swa_start:
             swa_model.update_parameters(model)
             swa_scheduler.step()
         else:
             scheduler.step()
 
-        # ── Checkpoint ─────────────────────────────────────────────────────────
         if val_f1 > best_f1 and SAVE_MODEL:
-            best_f1 = val_f1
+            best_f1    = val_f1
             no_improve = 0
             torch.save(model.state_dict(), f"model_{NICKNAME}.pt")
-            torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                        "scheduler": scheduler.state_dict(), "epoch": epoch, "best_f1": best_f1},
-                       ckpt_path)
-            save_results(df_test, apply_thresholds(run_inference(model, test_ds), best_thresholds))
+            torch.save({
+                "model":     model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "epoch":     epoch,
+                "best_f1":   best_f1,
+            }, ckpt_path)
+            save_results(df_test,
+                         apply_thresholds(run_inference(model, test_ds),
+                                          best_thresholds))
             analyse_per_attribute(model, val_ds, best_thresholds, tag=f"ep{epoch}")
             print(f"  ✔ saved  val_f1={best_f1:.5f}")
         else:
@@ -510,13 +476,14 @@ def train_and_test(train_ds, val_ds, test_ds):
     val_probs  = run_inference(swa_model, val_ds)
     val_labels = np.vstack([y.numpy() for _, y in val_ds])
     swa_thr    = tune_thresholds(val_probs, val_labels)
-    swa_preds  = apply_thresholds(val_probs, swa_thr)
-    swa_f1     = f1_score(val_labels, swa_preds, average="macro", zero_division=0)
+    swa_f1     = f1_score(val_labels, apply_thresholds(val_probs, swa_thr),
+                          average="macro", zero_division=0)
     print(f"SWA val_f1={swa_f1:.5f}  (best={best_f1:.5f})")
 
     if swa_f1 > best_f1:
         torch.save(swa_model.module.state_dict(), f"model_{NICKNAME}.pt")
-        save_results(df_test, apply_thresholds(run_inference(swa_model, test_ds), swa_thr))
+        save_results(df_test,
+                     apply_thresholds(run_inference(swa_model, test_ds), swa_thr))
         analyse_per_attribute(swa_model, val_ds, swa_thr, tag="swa")
         print("  ✔ SWA model saved!")
 
@@ -528,7 +495,6 @@ if __name__ == "__main__":
     df_val   = df_all[df_all["partition"] == 1].copy()
     df_test  = df_all[df_all["partition"] == 2].copy()
 
-    # pos_weight: compensate class imbalance across 40 attributes
     targets    = np.array(df_train["target_class"]
                           .apply(lambda s: [int(e) for e in s.split(",")]).tolist())
     pos_weight = torch.tensor(
