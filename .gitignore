@@ -1,0 +1,22 @@
+# Model weights (too large for git — share manually or via cloud storage)
+Models/*.pt
+
+# Generated image samples (outputs of cVAE — not source code)
+Generated/
+
+# Dataset and cache (never commit raw data or preprocessed tensors)
+Data/img_align_celeba/
+Data/list_attr_celeba.csv
+Data/list_eval_partition.csv
+Data/tensor_cache/
+Data/tensor_cache_64/
+Data/_download_tmp/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# OS
+.DS_Store

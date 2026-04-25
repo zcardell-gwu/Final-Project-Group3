@@ -29,12 +29,13 @@ if torch.cuda.is_available():
 # │   └── img_align_celeba/     ← 202,599 jpg
 # ├── list_attr_celeba.csv
 # └── list_eval_partition.csv
-BASE_DIR       = os.path.dirname(os.path.abspath(__file__))   # celeba/code/
-CELEBA_DIR     = os.path.dirname(BASE_DIR)                    # celeba/
-DATA_DIR       = os.path.join(CELEBA_DIR, "data", "img_align_celeba") + os.path.sep
-ATTR_FILE      = os.path.join(CELEBA_DIR, "list_attr_celeba.csv")
-PARTITION_FILE = os.path.join(CELEBA_DIR, "list_eval_partition.csv")
-CACHE_DIR      = os.path.join(CELEBA_DIR, "tensor_cache")    # preprocessed tensors
+BASE_DIR       = os.path.dirname(os.path.abspath(__file__))   # Code/
+CELEBA_DIR     = os.path.dirname(BASE_DIR)                    # Final-Project-Group3/
+DATA_DIR       = os.path.join(CELEBA_DIR, "Data", "img_align_celeba") + os.path.sep
+ATTR_FILE      = os.path.join(CELEBA_DIR, "Data", "list_attr_celeba.csv")
+PARTITION_FILE = os.path.join(CELEBA_DIR, "Data", "list_eval_partition.csv")
+CACHE_DIR      = os.path.join(CELEBA_DIR, "Data", "tensor_cache")
+MODELS_DIR     = os.path.join(CELEBA_DIR, "Models")
 
 # ── Hyperparameters ────────────────────────────────────────────────────────────
 n_epoch    = 20
@@ -359,7 +360,7 @@ def train_and_test(train_ds, val_ds, test_ds):
     best_f1         = 0.0
     no_improve      = 0
     patience        = 8
-    ckpt_path       = f"checkpoint_{NICKNAME}.pt"
+    ckpt_path       = os.path.join(MODELS_DIR, f"checkpoint_{NICKNAME}.pt")
     best_thresholds = [0.5] * OUTPUTS_a
     log_rows        = []
 
@@ -449,7 +450,7 @@ def train_and_test(train_ds, val_ds, test_ds):
         if val_f1 > best_f1 and SAVE_MODEL:
             best_f1    = val_f1
             no_improve = 0
-            torch.save(model.state_dict(), f"model_{NICKNAME}.pt")
+            torch.save(model.state_dict(), os.path.join(MODELS_DIR, f"model_{NICKNAME}.pt"))
             torch.save({
                 "model":     model.state_dict(),
                 "optimizer": optimizer.state_dict(),
@@ -481,7 +482,7 @@ def train_and_test(train_ds, val_ds, test_ds):
     print(f"SWA val_f1={swa_f1:.5f}  (best={best_f1:.5f})")
 
     if swa_f1 > best_f1:
-        torch.save(swa_model.module.state_dict(), f"model_{NICKNAME}.pt")
+        torch.save(swa_model.module.state_dict(), os.path.join(MODELS_DIR, f"model_{NICKNAME}.pt"))
         save_results(df_test,
                      apply_thresholds(run_inference(swa_model, test_ds), swa_thr))
         analyse_per_attribute(swa_model, val_ds, swa_thr, tag="swa")
