@@ -1,8 +1,10 @@
 torch
 torchvision
+torchmetrics[image]
 opencv-python
 pandas
 numpy
+scipy
 scikit-learn
 tqdm
 openpyxl

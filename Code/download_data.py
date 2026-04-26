@@ -40,8 +40,10 @@ GDRIVE_IDS = {
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 def already_done():
+    img_dir = os.path.join(DATA_DIR, "img_align_celeba")
     return (
-        os.path.isdir(os.path.join(DATA_DIR, "img_align_celeba"))
+        os.path.isdir(img_dir)
+        and any(f.endswith(".jpg") for f in os.listdir(img_dir))
         and os.path.isfile(os.path.join(DATA_DIR, "list_attr_celeba.csv"))
         and os.path.isfile(os.path.join(DATA_DIR, "list_eval_partition.csv"))
     )
@@ -53,9 +55,13 @@ def convert_and_place(src_dir):
     # ── Images ──────────────────────────────────────────────────────────────
     img_src = os.path.join(src_dir, "img_align_celeba")
     img_dst = os.path.join(DATA_DIR, "img_align_celeba")
-    if os.path.isdir(img_src) and not os.path.isdir(img_dst):
-        print(f"  Moving images → {img_dst}")
-        shutil.move(img_src, img_dst)
+    if os.path.isdir(img_src):
+        # Remove placeholder dir (empty or containing only .gitkeep) so shutil.move works
+        if os.path.isdir(img_dst) and not any(f.endswith(".jpg") for f in os.listdir(img_dst)):
+            shutil.rmtree(img_dst)
+        if not os.path.isdir(img_dst):
+            print(f"  Moving images → {img_dst}")
+            shutil.move(img_src, img_dst)
     elif not os.path.isdir(img_dst):
         print("  ✗ img_align_celeba not found in download — check source.")
         return False
