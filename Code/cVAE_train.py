@@ -599,7 +599,7 @@ def train(df_train, df_val):
 
         if vl_r < best_val_recon and SAVE_MODEL:
             best_val_recon = vl_r
-            torch.save(model.state_dict(), os.path.join(MODELS_DIR, f"model_{NICKNAME}.pt"))
+            torch.save(model.state_dict(), os.path.join(MODELS_DIR, f"model_{NICKNAME}_final.pt"))
             torch.save({
                 "model":          model.state_dict(),
                 "optimizer":      optimizer.state_dict(),
@@ -607,7 +607,7 @@ def train(df_train, df_val):
                 "epoch":          epoch,
                 "best_val_recon": best_val_recon,
             }, ckpt_path)
-            print(f"  ✔ saved  val_recon={best_val_recon:.5f}")
+            print(f"  ✔ saved model_{NICKNAME}_final.pt  val_recon={best_val_recon:.5f}")
 
     print("Training complete.")
     return model
@@ -644,3 +644,4 @@ if __name__ == "__main__":
     if fid is not None:
         with open(f"training_log_{NICKNAME}.fid.txt", "w") as f:
             f.write(f"FID @ end of training: {fid:.4f}\n")
+
