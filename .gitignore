@@ -1,5 +1,9 @@
-# Model weights (too large for git — share manually or via cloud storage)
-Models/*.pt
+# Model weights and backups (too large for git — share manually or via cloud storage)
+Models/**/*.pt
+Models/**/*.bak
+
+# Claude Code configuration
+.claude/
 
 # Generated image samples (outputs of cVAE — not source code)
 Generated/

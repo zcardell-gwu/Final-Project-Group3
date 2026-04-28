@@ -8,7 +8,8 @@ from torchvision import transforms
 from cVAE_train import CVAE, CLASS_NAMES, device
 from classifier_train import CNN_BiLSTM
 
-ROOT = "/home/ubuntu/Final-Project-Group3"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))   # Code/
+ROOT = os.path.dirname(BASE_DIR)                        # repo root
 MODEL_DIR = os.path.join(ROOT, "Models")
 DATA_DIR = os.path.join(ROOT, "Data")
 OUT_DIR = os.path.join(ROOT, "Generated", "evaluation")
@@ -38,7 +39,12 @@ clf.load_state_dict(
 clf.eval()
 
 # ---------- Load thresholds ----------
-thr_path = os.path.join(ROOT, "per_attr_f1_Group3.csv")
+try:
+    thr_path = os.path.join(BASE_DIR, "per_attr_f1_Group3.csv")
+    with open(thr_path):
+        pass
+except FileNotFoundError:
+    thr_path = os.path.join(ROOT, "per_attr_f1_Group3.csv")
 
 if os.path.exists(thr_path):
     thr_df = pd.read_csv(thr_path)
