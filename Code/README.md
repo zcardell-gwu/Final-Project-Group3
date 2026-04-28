@@ -1,21 +1,35 @@
-# Final Project Code
+## Execution Order
 
-Attribute-controlled facial generation with systematic accuracy evaluation.
+**Step 1: Prepare Data**
+Download CelebA dataset from Kaggle:
+https://www.kaggle.com/datasets/jessicali9530/celeba-dataset/data
 
-## Project Overview
+**Step 2: Run Classifier Training**
+python "train script.py"
 
-DenseNet169 backbone → BiLSTM over spatial rows → multi-label classifier
+- First run automatically pre-caches all images (CLAHE + resize) — takes ~15 min, runs once only
+- Trains DenseNet169 + BiLSTM for up to 20 epochs with early stopping
+- Saves best model to Models/model_Group3.pt
 
-    Flow:
-      Image (B,3,H,W)
-        → DenseNet169 feature map  (B, 1664, h, w)   h=w=7 for 224px input
-        → treat h rows as timesteps, each row = w*1664 features
-        → BiLSTM(hidden=512, layers=2)
-        → take last hidden state from both directions → (B, 1024)
-        → Linear → (B, 40)
+### Output Files
+- results_Group3.xlsx — predictions for all 19,962 test images
+- training_log_Group3.csv — per-epoch train/val loss and F1
+- per_attr_f1_Group3.csv / .txt — per-attribute F1 ranked report
+- summary_Group3.txt — model architecture and hyperparameters
+- model_Group3.pt — trained model weights (276MB, not uploaded to GitHub)
 
-    Rationale for CelebA:
-      Face images have a natural top-to-bottom spatial order
-      (hair → forehead → eyes → nose → mouth → chin).
-      BiLSTM can model both top-down and bottom-up dependencies
-      across these spatial rows, which plain global-pooling discards.
+
+### Step 3: Train CVAE
+```bash
+python cVAE_train_revised.py
+```
+
+### Step 4: Evaluate Generated Images
+```bash
+python evaluate_generated.py
+```
+
+### Step 5: Run Demo
+```bash
+streamlit run streamlit_demo.py
+```
