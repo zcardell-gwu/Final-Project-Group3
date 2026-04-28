@@ -1,5 +1,6 @@
-# Model weights (too large for git — share manually or via cloud storage)
+# Model weights and backups (too large for git — share manually or via cloud storage)
 Models/**/*.pt
+Models/**/*.bak
 
 # Claude Code configuration
 .claude/

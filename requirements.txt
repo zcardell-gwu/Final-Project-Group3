@@ -9,3 +9,6 @@ scikit-learn
 tqdm
 openpyxl
 gdown
+open-clip-torch
+streamlit
+Pillow
