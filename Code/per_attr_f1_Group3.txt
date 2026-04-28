@@ -1,0 +1,53 @@
+Per-attribute F1  [ep4]  — Group3
+=======================================================
+Rank  Attribute                     F1    N_pos    Thr
+-------------------------------------------------------
+1     Male                      0.9864    8,458   0.40
+2     No_Beard                  0.9770   16,338   0.15
+3     Eyeglasses                0.9709    1,383   0.85
+4     Mouth_Slightly_Open       0.9379    9,573   0.45
+5     Smiling                   0.9255    9,602   0.35
+6     Wearing_Lipstick          0.9217    8,860   0.75
+7     Young                     0.9188   14,832   0.30
+8     Heavy_Makeup              0.8995    7,751   0.70
+9     Wearing_Hat               0.8881      940   0.85
+10    High_Cheekbones           0.8631    8,926   0.50
+11    Bangs                     0.8628    2,915   0.85
+12    Blond_Hair                0.8596    3,056   0.85
+13    Attractive                0.8241   10,332   0.40
+14    Black_Hair                0.8055    4,144   0.75
+15    Wearing_Earrings          0.7890    3,789   0.70
+16    Gray_Hair                 0.7805      967   0.85
+17    Sideburns                 0.7778    1,367   0.85
+18    Wavy_Hair                 0.7755    5,495   0.70
+19    Wearing_Necktie           0.7751    1,443   0.85
+20    Bald                      0.7705      411   0.85
+21    Goatee                    0.7687    1,464   0.85
+22    5_o_Clock_Shadow          0.7538    2,345   0.80
+23    Arched_Eyebrows           0.7346    5,134   0.65
+24    Bushy_Eyebrows            0.7270    2,831   0.80
+25    Brown_Hair                0.7160    4,793   0.70
+26    Big_Nose                  0.6545    4,943   0.55
+27    Chubby                    0.6530    1,216   0.85
+28    Straight_Hair             0.6505    4,085   0.70
+29    Rosy_Cheeks               0.6471    1,358   0.85
+30    Mustache                  0.6442    1,003   0.85
+31    Double_Chin               0.6401      975   0.85
+32    Receding_Hairline         0.6385    1,429   0.85
+33    Blurry                    0.6309      940   0.85
+34    Bags_Under_Eyes           0.6229    4,121   0.60
+35    Pale_Skin                 0.6068      856   0.85
+36    Pointy_Nose               0.5839    5,660   0.50
+37    Narrow_Eyes               0.5690    1,492   0.85
+38    Oval_Face                 0.5359    5,565   0.45
+39    Wearing_Necklace          0.5315    2,396   0.75
+40    Big_Lips                  0.4481    3,044   0.65
+
+Macro F1: 0.7517
+
+Bottom 5 (hardest):
+  Pointy_Nose               F1=0.5839  N_pos=5,660
+  Narrow_Eyes               F1=0.5690  N_pos=1,492
+  Oval_Face                 F1=0.5359  N_pos=5,565
+  Wearing_Necklace          F1=0.5315  N_pos=2,396
+  Big_Lips                  F1=0.4481  N_pos=3,044
