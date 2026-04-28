@@ -128,20 +128,36 @@ section[data-testid="stSidebar"] div[data-testid="stButton"]:first-of-type butto
 </style>
 """, unsafe_allow_html=True)
 
-CVAE_PATH = "/home/ubuntu/Final-Project-Group3/Models/model_cVAE_Group3_final.pt"
+# # cVAE path (one model version)
+# CVAE_PATH = "/home/ubuntu/Final-Project-Group3/Models/model_cVAE_Group3_final.pt"
 
+# cVAE path (several models version)
+CVAE_MODEL_OPTIONS = {
+    "Final Model": "/home/ubuntu/Final-Project-Group3/Models/model_cVAE_Group3_final.pt",
+    "Old Model": "/home/ubuntu/Final-Project-Group3/Models/model_cVAE_Group3.pt",
+}
+
+# # Load cVAE (one model version)
+# @st.cache_resource
+# def load_cvae():
+#     model = CVAE().to(device)
+#     model.load_state_dict(torch.load(CVAE_PATH, map_location=device))
+#     model.eval()
+#     return model
+#
+# cvae = load_cvae()
+
+# Load cVAE (several models version)
 @st.cache_resource
-def load_cvae():
+def load_cvae(model_path):
     model = CVAE().to(device)
-    model.load_state_dict(torch.load(CVAE_PATH, map_location=device))
+    model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
     return model
 
-cvae = load_cvae()
-
+# Load classifier
 CLASSIFIER_PATH = "/home/ubuntu/Final-Project-Group3/Models/model_Group3.pt"
 THRESHOLD_PATH = "/home/ubuntu/Final-Project-Group3/per_attr_f1_Group3.csv"
-
 @st.cache_resource
 def load_classifier():
     model = CNN_BiLSTM().to(device)
@@ -344,7 +360,7 @@ def detect_conflicts(target_attrs):
 
 
 # cVAE generation function
-def generate_faces(target_attrs, n_images=8):
+def generate_faces(cvae_model, target_attrs, n_images=8):
     # ---------- build attribute vector ----------
     attr_vec = torch.zeros(len(CLASS_NAMES), device=device)
 
@@ -356,7 +372,7 @@ def generate_faces(target_attrs, n_images=8):
 
     # ---------- generate ----------
     with torch.no_grad():
-        imgs = cvae.generate(attr_vec)
+        imgs = cvae_model.generate(attr_vec)
 
     imgs = torch.clamp(imgs, 0, 1)
 
@@ -556,6 +572,23 @@ elif st.session_state.page == "generate":
     # Placeholder
     conflict_boxes = {}
 
+    # Select boxes
+    model_choice = st.selectbox(
+        "Choose a cVAE model",
+        list(CVAE_MODEL_OPTIONS.keys())
+    )
+
+    if "prev_cvae_model_choice" not in st.session_state:
+        st.session_state.prev_cvae_model_choice = model_choice
+
+    if st.session_state.prev_cvae_model_choice != model_choice:
+        st.session_state.pop("generated_grid", None)
+        st.session_state.pop("generated_imgs", None)
+        st.session_state.prev_cvae_model_choice = model_choice
+
+    st.session_state.cvae_model_choice = model_choice
+    st.session_state.cvae_model_path = CVAE_MODEL_OPTIONS[model_choice]
+
     gender_choice = st.selectbox(
         "Gender",
         ["Skip", "Male", "Female"]
@@ -656,6 +689,7 @@ elif st.session_state.page == "generate":
 # ---------- Module 1 Result Page ----------
 elif st.session_state.page == "generate_result":
     st.title("Generated Images & Classifier Evaluation")
+    st.caption(f"cVAE model: {st.session_state.cvae_model_choice}")
 
     # Results section
     target_attrs = st.session_state.selected_attrs
@@ -664,7 +698,8 @@ elif st.session_state.page == "generate_result":
     # Uses st.spinner while generation/evaluation is running.
     if "generated_grid" not in st.session_state or "generated_imgs" not in st.session_state:
         with st.spinner("Generating images with cVAE..."):
-            grid, imgs = generate_faces(target_attrs, st.session_state.n_images)
+            selected_cvae = load_cvae(st.session_state.cvae_model_path)
+            grid, imgs = generate_faces(selected_cvae, target_attrs, st.session_state.n_images)
             st.session_state.generated_grid = grid
             st.session_state.generated_imgs = imgs
     else:
