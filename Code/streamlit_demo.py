@@ -1,7 +1,10 @@
 import streamlit as st
 import pandas as pd
 import torch
-from cVAE_train_revised import CVAE, CLASS_NAMES, device
+from cVAE_train_revised import CLASS_NAMES, device
+from cVAE_train_revised import CVAE as CVAE_old
+from cVAE_model_option1_sigma import CVAE as CVAE_new1
+# from cVAE_train_option1_lipps import CVAE as CVAE_new2
 from torchvision.utils import make_grid
 import torch.nn.functional as F
 from classifier_train import CNN_BiLSTM
@@ -132,9 +135,19 @@ section[data-testid="stSidebar"] div[data-testid="stButton"]:first-of-type butto
 # CVAE_PATH = "/home/ubuntu/Final-Project-Group3/Models/model_cVAE_Group3_final.pt"
 
 # cVAE path (several models version)
+# CVAE_MODEL_OPTIONS = {
+#     "Final Model": "/home/ubuntu/Final-Project-Group3/Models/model_cVAE_Group3_final.pt",
+#     "Old Model": "/home/ubuntu/Final-Project-Group3/Models/model_cVAE_Group3_previous.pt",
+# }
 CVAE_MODEL_OPTIONS = {
-    "Final Model": "/home/ubuntu/Final-Project-Group3/Models/model_cVAE_Group3_final.pt",
-    "Old Model": "/home/ubuntu/Final-Project-Group3/Models/model_cVAE_Group3.pt",
+    "Final Model": {
+        "path": "/home/ubuntu/Final-Project-Group3/Models/model_cVAE_Group3_final.pt",
+        "type": "new1"
+    },
+    "Old Model": {
+        "path": "/home/ubuntu/Final-Project-Group3/Models/model_cVAE_Group3_previous.pt",
+        "type": "old"
+    },
 }
 
 # # Load cVAE (one model version)
@@ -148,9 +161,23 @@ CVAE_MODEL_OPTIONS = {
 # cvae = load_cvae()
 
 # Load cVAE (several models version)
+# @st.cache_resource
+# def load_cvae(model_path):
+#     model = CVAE().to(device)
+#     model.load_state_dict(torch.load(model_path, map_location=device))
+#     model.eval()
+#     return model
 @st.cache_resource
-def load_cvae(model_path):
-    model = CVAE().to(device)
+def load_cvae(model_path, model_type):
+    if model_type == "old":
+        model = CVAE_old().to(device)
+    elif model_type == "new1":
+        model = CVAE_new1().to(device)
+    # elif model_type == "new2":
+    #     model = CVAE_new2().to(device)
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
+
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
     return model
@@ -580,6 +607,9 @@ elif st.session_state.page == "generate":
 
     if "prev_cvae_model_choice" not in st.session_state:
         st.session_state.prev_cvae_model_choice = model_choice
+        # st.session_state.cvae_model_choice = model_choice
+        # st.session_state.cvae_model_path = CVAE_MODEL_OPTIONS[model_choice]["path"]
+        # st.session_state.cvae_model_type = CVAE_MODEL_OPTIONS[model_choice]["type"]
 
     if st.session_state.prev_cvae_model_choice != model_choice:
         st.session_state.pop("generated_grid", None)
@@ -587,7 +617,8 @@ elif st.session_state.page == "generate":
         st.session_state.prev_cvae_model_choice = model_choice
 
     st.session_state.cvae_model_choice = model_choice
-    st.session_state.cvae_model_path = CVAE_MODEL_OPTIONS[model_choice]
+    st.session_state.cvae_model_path = CVAE_MODEL_OPTIONS[model_choice]["path"]
+    st.session_state.cvae_model_type = CVAE_MODEL_OPTIONS[model_choice]["type"]
 
     gender_choice = st.selectbox(
         "Gender",
@@ -698,7 +729,11 @@ elif st.session_state.page == "generate_result":
     # Uses st.spinner while generation/evaluation is running.
     if "generated_grid" not in st.session_state or "generated_imgs" not in st.session_state:
         with st.spinner("Generating images with cVAE..."):
-            selected_cvae = load_cvae(st.session_state.cvae_model_path)
+            # selected_cvae = load_cvae(st.session_state.cvae_model_path)
+            selected_cvae = load_cvae(
+                st.session_state.cvae_model_path,
+                st.session_state.cvae_model_type
+            )
             grid, imgs = generate_faces(selected_cvae, target_attrs, st.session_state.n_images)
             st.session_state.generated_grid = grid
             st.session_state.generated_imgs = imgs
