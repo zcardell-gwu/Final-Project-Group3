@@ -61,4 +61,3 @@ streamlit run streamlit_demo.py
 ## Resolution
 
 The cVAE was retrained at 128×128 (up from 64×64). Generated images are upsampled to 224×224 before classifier scoring. The same upsampling is applied to real images so the comparison is fair.
-<img width="468" height="658" alt="image" src="https://github.com/user-attachments/assets/297b3602-e83a-45cd-b045-6949148a3856" />
